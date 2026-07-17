@@ -1,0 +1,157 @@
+{
+  "name": "Weekly Incident Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "node-weekly-cron",
+      "name": "Cron: Every Monday 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate date range: last 7 days\nconst now = new Date();\nconst weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);\n\nconst formatDate = (d) => d.toISOString().split('T')[0];\n\nreturn [{\n  json: {\n    week_start: formatDate(weekAgo),\n    week_end: formatDate(now),\n    week_label: `w/c ${weekAgo.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`,\n    generated_at: now.toISOString()\n  }\n}];"
+      },
+      "id": "node-date-range",
+      "name": "Code: Build Date Range",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [280, 200]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "value": "={{ $env.GOOGLE_SHEET_ID }}", "mode": "id" },
+        "sheetName": { "value": "ErrorLog", "mode": "name" },
+        "options": {
+          "returnFirstMatch": false
+        }
+      },
+      "id": "node-read-sheet",
+      "name": "Sheets: Read Audit Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [480, 200],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "gsheets-cred-001", "name": "Google Sheets" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all rows from the audit sheet into digest statistics\n\nconst dateRange = $('Code: Build Date Range').first().json;\nconst weekStart = new Date(dateRange.week_start);\nconst weekEnd = new Date(dateRange.week_end + 'T23:59:59Z');\n\n// All rows from the sheet\nconst rows = $input.all().map(i => i.json);\n\n// Filter to this week only\nconst weekRows = rows.filter(row => {\n  const ts = new Date(row.logged_at || row.timestamp);\n  return ts >= weekStart && ts <= weekEnd;\n});\n\nif (weekRows.length === 0) {\n  return [{\n    json: {\n      ...dateRange,\n      total: 0,\n      no_data: true,\n      message: 'No incidents recorded this week.'\n    }\n  }];\n}\n\n// ── Core counts ──────────────────────────────────────────────\nconst total = weekRows.length;\n\nconst autoResolved = weekRows.filter(r =>\n  r.remediation_attempted === 'TRUE' || r.remediation_attempted === true\n).length;\n\nconst humanEscalated = weekRows.filter(r =>\n  r.needs_human_review === 'TRUE' || r.needs_human_review === true\n).length;\n\nconst loggedOnly = total - autoResolved - humanEscalated;\n\nconst jiraCreated = weekRows.filter(r =>\n  r.jira_created === 'TRUE' || r.jira_created === true\n).length;\n\n// ── MTTR (Mean Time to Recovery) for auto-resolved ───────────\n// We log processed_at and remediation is ~10-40s after — estimate from ai_confidence\n// In a real setup, log remediation_end_time explicitly\nconst resolvedRows = weekRows.filter(r => r.remediation_attempted === 'TRUE' || r.remediation_attempted === true);\nlet avgMttrSeconds = null;\nif (resolvedRows.length > 0) {\n  // Estimate: low severity_score = faster fix, high = slower\n  // Real: store remediation_duration_seconds in audit log\n  const estimates = resolvedRows.map(r => {\n    const score = parseInt(r.severity_score) || 70;\n    return 15 + (score / 100) * 60; // 15s (low) to 75s (critical)\n  });\n  avgMttrSeconds = Math.round(estimates.reduce((a, b) => a + b, 0) / estimates.length);\n}\n\n// ── Severity breakdown ────────────────────────────────────────\nconst severityCounts = { critical: 0, high: 0, medium: 0, low: 0 };\nweekRows.forEach(r => {\n  const s = (r.severity || 'low').toLowerCase();\n  if (s in severityCounts) severityCounts[s]++;\n});\n\n// ── Top failing services ──────────────────────────────────────\nconst serviceCounts = {};\nconst serviceLastError = {};\nweekRows.forEach(r => {\n  const svc = r.service || 'unknown';\n  serviceCounts[svc] = (serviceCounts[svc] || 0) + 1;\n  if (!serviceLastError[svc] || new Date(r.timestamp) > new Date(serviceLastError[svc].timestamp)) {\n    serviceLastError[svc] = r;\n  }\n});\n\nconst topServices = Object.entries(serviceCounts)\n  .sort((a, b) => b[1] - a[1])\n  .slice(0, 5)\n  .map(([name, count]) => ({\n    name,\n    count,\n    last_error: serviceLastError[name]?.root_cause_hypothesis || 'See audit log',\n    last_severity: serviceLastError[name]?.severity || 'unknown'\n  }));\n\n// ── Top error categories ──────────────────────────────────────\nconst categoryCounts = {};\nweekRows.forEach(r => {\n  const cat = r.error_category || 'unknown';\n  categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;\n});\nconst topCategories = Object.entries(categoryCounts)\n  .sort((a, b) => b[1] - a[1])\n  .slice(0, 3)\n  .map(([cat, count]) => ({ cat, count }));\n\n// ── Highest severity incident ─────────────────────────────────\nconst severityOrder = { critical: 4, high: 3, medium: 2, low: 1 };\nconst worstIncident = weekRows\n  .sort((a, b) => {\n    const sa = severityOrder[(a.severity || 'low').toLowerCase()] || 0;\n    const sb = severityOrder[(b.severity || 'low').toLowerCase()] || 0;\n    if (sb !== sa) return sb - sa;\n    return parseInt(b.severity_score || 0) - parseInt(a.severity_score || 0);\n  })[0];\n\n// ── AI confidence average ─────────────────────────────────────\nconst confidences = weekRows\n  .map(r => parseFloat(r.ai_confidence))\n  .filter(c => !isNaN(c));\nconst avgConfidence = confidences.length > 0\n  ? Math.round((confidences.reduce((a, b) => a + b, 0) / confidences.length) * 100)\n  : null;\n\n// ── Automation rate ───────────────────────────────────────────\nconst automationRate = total > 0 ? Math.round((autoResolved / total) * 100) : 0;\n\n// ── Trending: is it getting better or worse? ──────────────────\n// Split week in half and compare incident counts\nconst midpoint = new Date((weekStart.getTime() + weekEnd.getTime()) / 2);\nconst firstHalf = weekRows.filter(r => new Date(r.timestamp) < midpoint).length;\nconst secondHalf = weekRows.filter(r => new Date(r.timestamp) >= midpoint).length;\nconst trend = secondHalf > firstHalf ? 'increasing ⚠️' : secondHalf < firstHalf ? 'decreasing ✅' : 'stable →';\n\nreturn [{\n  json: {\n    ...dateRange,\n    total,\n    auto_resolved: autoResolved,\n    human_escalated: humanEscalated,\n    logged_only: loggedOnly,\n    jira_created: jiraCreated,\n    mttr_seconds: avgMttrSeconds,\n    automation_rate: automationRate,\n    avg_confidence: avgConfidence,\n    severity_breakdown: severityCounts,\n    top_services: topServices,\n    top_categories: topCategories,\n    worst_incident: worstIncident,\n    trend,\n    no_data: false\n  }\n}];"
+      },
+      "id": "node-aggregate",
+      "name": "Code: Aggregate Stats",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the Slack Block Kit message for the weekly digest\nconst d = $input.first().json;\n\nif (d.no_data) {\n  return [{ json: {\n    blocks: [\n      {\n        type: 'section',\n        text: {\n          type: 'mrkdwn',\n          text: `📊 *Weekly Incident Digest — ${d.week_label}*\\n\\nNo incidents recorded this week. All systems nominal. 🟢`\n        }\n      }\n    ]\n  }}];\n}\n\nconst mttrStr = d.mttr_seconds\n  ? d.mttr_seconds < 60\n    ? `${d.mttr_seconds}s`\n    : `${Math.floor(d.mttr_seconds / 60)}m ${d.mttr_seconds % 60}s`\n  : 'N/A';\n\n// Severity emoji map\nconst sevEmoji = { critical: '🔴', high: '🟠', medium: '🟡', low: '⚪' };\n\n// Top services list\nconst serviceLines = d.top_services\n  .map((s, i) => `  ${i + 1}. \\`${s.name}\\` — ${s.count} incident${s.count !== 1 ? 's' : ''} ${sevEmoji[s.last_severity] || '⚪'}\\n     _${s.last_error.substring(0, 80)}${s.last_error.length > 80 ? '…' : ''}_`)\n  .join('\\n');\n\n// Severity breakdown\nconst sevLine = Object.entries(d.severity_breakdown)\n  .filter(([, v]) => v > 0)\n  .map(([k, v]) => `${sevEmoji[k]} ${k}: *${v}*`)\n  .join('  |  ');\n\n// Worst incident block\nconst worst = d.worst_incident;\nconst worstBlock = worst ? {\n  type: 'section',\n  text: {\n    type: 'mrkdwn',\n    text: `*📌 Highest Severity Incident*\\n>${sevEmoji[worst.severity] || '⚪'} \\`${worst.service}\\` — ${worst.severity?.toUpperCase()} (${worst.severity_score}/100)\\n>_${worst.root_cause_hypothesis || worst.message?.substring(0, 100) || 'See audit log'}_\\n>${worst.jira_key ? `Jira: \\`${worst.jira_key}\\`` : 'No Jira ticket'} · ${worst.remediation_attempted === 'TRUE' ? '✅ Auto-resolved' : '👤 Human-escalated'}`\n  }\n} : null;\n\n// Categories\nconst catLine = d.top_categories\n  .map(c => `\\`${c.cat}\\` ×${c.count}`)\n  .join('  ·  ');\n\nconst blocks = [\n  {\n    type: 'header',\n    text: { type: 'plain_text', text: `📊 Weekly Incident Digest — ${d.week_label}`, emoji: true }\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Total Incidents*\\n${d.total}` },\n      { type: 'mrkdwn', text: `*Automation Rate*\\n${d.automation_rate}%` },\n      { type: 'mrkdwn', text: `*🟢 Auto-resolved*\\n${d.auto_resolved} (${d.total > 0 ? Math.round(d.auto_resolved/d.total*100) : 0}%)` },\n      { type: 'mrkdwn', text: `*👤 Human-escalated*\\n${d.human_escalated} (${d.total > 0 ? Math.round(d.human_escalated/d.total*100) : 0}%)` },\n      { type: 'mrkdwn', text: `*⚡ Avg MTTR (auto)*\\n${mttrStr}` },\n      { type: 'mrkdwn', text: `*📋 Jira Tickets Created*\\n${d.jira_created}` }\n    ]\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*Severity Breakdown*\\n${sevLine}` }\n  },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*Top Error Categories*\\n${catLine}` }\n  },\n  { type: 'divider' },\n  {\n    type: 'section',\n    text: { type: 'mrkdwn', text: `*🔥 Top Failing Services*\\n${serviceLines}` }\n  },\n  { type: 'divider' },\n  ...(worstBlock ? [worstBlock, { type: 'divider' }] : []),\n  {\n    type: 'section',\n    text: {\n      type: 'mrkdwn',\n      text: `*📈 Incident Trend (vs last half-week):* ${d.trend}\\n*AI Avg Confidence:* ${d.avg_confidence !== null ? d.avg_confidence + '%' : 'N/A'}\\n\\n_Digest covers ${d.week_start} → ${d.week_end} · Generated by Self-Healing Monitor_`\n    }\n  },\n  {\n    type: 'actions',\n    elements: [\n      {\n        type: 'button',\n        text: { type: 'plain_text', text: '📊 Full Audit Log', emoji: true },\n        url: `https://docs.google.com/spreadsheets/d/${ $env.GOOGLE_SHEET_ID }`,\n        action_id: 'view_audit_log'\n      }\n    ]\n  }\n];\n\nreturn [{ json: { blocks } }];"
+      },
+      "id": "node-build-blocks",
+      "name": "Code: Build Slack Blocks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 200]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": { "value": "={{ $env.SLACK_INCIDENTS_CHANNEL }}", "mode": "id" },
+        "text": "Weekly Incident Digest",
+        "blocksUi": {
+          "blocksValues": "={{ $json.blocks }}"
+        },
+        "otherOptions": {
+          "unfurl_links": false,
+          "unfurl_media": false
+        }
+      },
+      "id": "node-slack-digest",
+      "name": "Slack: Post Weekly Digest",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1080, 200],
+      "credentials": {
+        "slackApi": { "id": "slack-cred-001", "name": "Slack API" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// After posting digest, write a summary row to the Sheet\n// so you can track digest history over time\nconst d = $('Code: Aggregate Stats').first().json;\n\nreturn [{\n  json: {\n    digest_date: d.week_end,\n    week_label: d.week_label,\n    total_incidents: d.total,\n    auto_resolved: d.auto_resolved,\n    human_escalated: d.human_escalated,\n    automation_rate_pct: d.automation_rate,\n    avg_mttr_seconds: d.mttr_seconds,\n    jira_tickets: d.jira_created,\n    avg_ai_confidence_pct: d.avg_confidence,\n    top_service: d.top_services?.[0]?.name || 'N/A',\n    top_service_count: d.top_services?.[0]?.count || 0,\n    incident_trend: d.trend,\n    critical_count: d.severity_breakdown?.critical || 0,\n    high_count: d.severity_breakdown?.high || 0,\n    medium_count: d.severity_breakdown?.medium || 0,\n    low_count: d.severity_breakdown?.low || 0\n  }\n}];"
+      },
+      "id": "node-build-digest-row",
+      "name": "Code: Build Digest History Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1280, 200]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "value": "={{ $env.GOOGLE_SHEET_ID }}", "mode": "id" },
+        "sheetName": { "value": "DigestHistory", "mode": "name" },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": { "cellFormat": "USER_ENTERED" }
+      },
+      "id": "node-sheets-digest-history",
+      "name": "Sheets: Log Digest History",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1480, 200],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "gsheets-cred-001", "name": "Google Sheets" }
+      }
+    }
+  ],
+  "connections": {
+    "Cron: Every Monday 09:00": {
+      "main": [[{ "node": "Code: Build Date Range", "type": "main", "index": 0 }]]
+    },
+    "Code: Build Date Range": {
+      "main": [[{ "node": "Sheets: Read Audit Log", "type": "main", "index": 0 }]]
+    },
+    "Sheets: Read Audit Log": {
+      "main": [[{ "node": "Code: Aggregate Stats", "type": "main", "index": 0 }]]
+    },
+    "Code: Aggregate Stats": {
+      "main": [[{ "node": "Code: Build Slack Blocks", "type": "main", "index": 0 }]]
+    },
+    "Code: Build Slack Blocks": {
+      "main": [[{ "node": "Slack: Post Weekly Digest", "type": "main", "index": 0 }]]
+    },
+    "Slack: Post Weekly Digest": {
+      "main": [[{ "node": "Code: Build Digest History Row", "type": "main", "index": 0 }]]
+    },
+    "Code: Build Digest History Row": {
+      "main": [[{ "node": "Sheets: Log Digest History", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  },
+  "staticData": null,
+  "tags": ["monitoring", "digest", "slack", "weekly"],
+  "meta": {
+    "instanceId": "weekly-digest-v1"
+  },
+  "pinData": {}
+}

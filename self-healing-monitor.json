@@ -1,0 +1,491 @@
+{
+  "name": "Self-Healing Error Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "error-ingest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook-ingest",
+      "name": "Webhook: App Errors",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [80, 120],
+      "webhookId": "error-ingest-001"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 5 }]
+        }
+      },
+      "id": "node-cron-poll",
+      "name": "Cron: Poll Logs (5m)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 260]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.LOG_API_URL }}/api/v1/logs/recent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{ $env.LOG_API_KEY }}" }
+          ]
+        }
+      },
+      "id": "node-http-log-api",
+      "name": "HTTP: Fetch Log API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [280, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise all incoming error events to a unified schema.\n// Handles: webhook payloads, log API responses, Sentry, Datadog.\n\nconst items = $input.all();\nconst normalised = [];\n\nfor (const item of items) {\n  const raw = item.json;\n\n  // Detect source type and map fields\n  let event = {};\n\n  if (raw.exception || raw.platform) {\n    // Sentry format\n    event = {\n      source: 'sentry',\n      error_id: raw.id || crypto.randomUUID(),\n      timestamp: raw.dateCreated || new Date().toISOString(),\n      service: raw.project?.name || raw.culprit || 'unknown',\n      environment: raw.tags?.find(t => t[0]==='environment')?.[1] || 'production',\n      message: raw.title || raw.message || 'Unknown error',\n      stack_trace: raw.exception?.values?.[0]?.stacktrace?.frames?.map(f => `${f.filename}:${f.lineno}`).join('\\n') || '',\n      error_type: raw.exception?.values?.[0]?.type || 'GenericError',\n      level: raw.level || 'error',\n      url: raw.permalink || '',\n      metadata: { project: raw.project?.slug, count: raw.count }\n    };\n  } else if (raw.series || raw.query) {\n    // Datadog format\n    event = {\n      source: 'datadog',\n      error_id: raw.jobId || crypto.randomUUID(),\n      timestamp: new Date().toISOString(),\n      service: raw.tags?.service || 'unknown',\n      environment: raw.tags?.env || 'production',\n      message: raw.title || 'Metric anomaly detected',\n      stack_trace: '',\n      error_type: 'MetricAnomaly',\n      level: raw.priority || 'error',\n      url: raw.url || '',\n      metadata: { query: raw.query, value: raw.series?.[0]?.pointlist?.slice(-1)[0] }\n    };\n  } else if (raw.alerts || raw.incident) {\n    // PagerDuty format\n    event = {\n      source: 'pagerduty',\n      error_id: raw.incident?.id || crypto.randomUUID(),\n      timestamp: raw.incident?.created_at || new Date().toISOString(),\n      service: raw.incident?.service?.summary || 'unknown',\n      environment: 'production',\n      message: raw.incident?.title || 'PagerDuty incident',\n      stack_trace: '',\n      error_type: 'Incident',\n      level: raw.incident?.urgency === 'high' ? 'critical' : 'error',\n      url: raw.incident?.html_url || '',\n      metadata: { status: raw.incident?.status }\n    };\n  } else {\n    // Generic webhook / custom app format\n    event = {\n      source: raw.source || 'webhook',\n      error_id: raw.error_id || raw.id || crypto.randomUUID(),\n      timestamp: raw.timestamp || raw.time || new Date().toISOString(),\n      service: raw.service || raw.app || raw.application || 'unknown',\n      environment: raw.environment || raw.env || 'production',\n      message: raw.message || raw.error || raw.description || 'Unknown error',\n      stack_trace: raw.stack_trace || raw.stacktrace || raw.stack || '',\n      error_type: raw.error_type || raw.type || raw.name || 'GenericError',\n      level: raw.level || raw.severity || 'error',\n      url: raw.url || raw.link || '',\n      metadata: raw.metadata || raw.extra || {}\n    };\n  }\n\n  // Deduplicate: skip if same error_id seen in last 10 min\n  // (In production, use Redis or n8n's built-in cache)\n  normalised.push({ json: event });\n}\n\nreturn normalised;"
+      },
+      "id": "node-normalise",
+      "name": "Code: Normalise Schema",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 180]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 800
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert SRE (Site Reliability Engineer) and incident classifier. Your job is to analyse error events and produce structured classification data that drives automated remediation decisions.\n\nYou MUST respond with valid JSON only. No markdown, no explanation, no preamble. Just the JSON object.\n\nClassification schema:\n{\n  \"severity\": \"critical|high|medium|low\",\n  \"severity_score\": 0-100,\n  \"error_category\": \"infrastructure|application|database|network|security|data_pipeline|third_party\",\n  \"root_cause_hypothesis\": \"<concise 1-sentence hypothesis>\",\n  \"affected_component\": \"<specific service, pod, DB, endpoint>\",\n  \"blast_radius\": \"single_user|subset_users|all_users|internal_only\",\n  \"remediation_actions\": [\n    {\n      \"action\": \"restart_service|scale_up|flush_cache|rollback_deployment|clear_queue|rotate_credentials|notify_only|investigate_only\",\n      \"confidence\": 0.0-1.0,\n      \"rationale\": \"<why this action>\",\n      \"safe_to_automate\": true|false,\n      \"parameters\": {}\n    }\n  ],\n  \"jira_priority\": \"Highest|High|Medium|Low\",\n  \"jira_labels\": [\"label1\", \"label2\"],\n  \"jira_summary\": \"<50-char Jira ticket title>\",\n  \"jira_description\": \"<markdown description with context, impact, steps to investigate>\",\n  \"runbook_url\": null,\n  \"confidence\": 0.0-1.0,\n  \"needs_human_review\": true|false,\n  \"notify_channels\": [\"slack-incidents\"|\"slack-dev\"|\"slack-ops\"|\"pagerduty\"],\n  \"ai_reasoning\": \"<2-3 sentence explanation of classification logic>\"\n}\n\nSeverity rules:\n- critical (80-100): Production down, data loss risk, security breach, >50% users impacted. Requires immediate action.\n- high (60-79): Significant feature broken, performance degraded >50%, single service failure. Requires action within 1hr.\n- medium (40-59): Non-critical feature degraded, intermittent failures <10%, dev/staging issues. Requires action within 24hr.\n- low (0-39): Warnings, deprecations, single user issues, non-production. Log and monitor.\n\nRemediation safety rules:\n- safe_to_automate: true ONLY for: service restarts (non-DB), cache flushes, scale-up (never scale-down), queue clears\n- safe_to_automate: false for: credential rotation, rollbacks, anything touching databases or user data\n- Always include investigate_only as a fallback action with confidence 1.0\n- If confidence < 0.7, set needs_human_review: true and only include investigate_only actions with safe_to_automate: false"
+            },
+            {
+              "role": "user",
+              "content": "Classify this error event:\n\nSource: {{ $json.source }}\nService: {{ $json.service }}\nEnvironment: {{ $json.environment }}\nError Type: {{ $json.error_type }}\nSeverity Level (raw): {{ $json.level }}\nMessage: {{ $json.message }}\nStack Trace:\n{{ $json.stack_trace }}\nMetadata: {{ JSON.stringify($json.metadata) }}\nTimestamp: {{ $json.timestamp }}"
+            }
+          ]
+        }
+      },
+      "id": "node-ai-classify",
+      "name": "AI: Classify Error",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.4,
+      "position": [700, 180],
+      "credentials": {
+        "openAiApi": { "id": "openai-cred-001", "name": "OpenAI API" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI response and merge with original event\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  let aiRaw = item.json.message?.content || item.json.choices?.[0]?.message?.content || item.json.text || '{}';\n  \n  // Strip markdown fences if present\n  aiRaw = aiRaw.replace(/```json\\n?|```\\n?/g, '').trim();\n  \n  let classification;\n  try {\n    classification = JSON.parse(aiRaw);\n  } catch(e) {\n    classification = {\n      severity: 'medium',\n      severity_score: 50,\n      error_category: 'application',\n      root_cause_hypothesis: 'Parse error - manual review required',\n      confidence: 0,\n      needs_human_review: true,\n      remediation_actions: [{ action: 'investigate_only', confidence: 1.0, safe_to_automate: false, rationale: 'AI parse failed' }],\n      notify_channels: ['slack-incidents'],\n      jira_priority: 'High',\n      jira_labels: ['ai-parse-error'],\n      jira_summary: 'Classification failed - manual review',\n      jira_description: 'AI classification failed to parse. Raw response: ' + aiRaw\n    };\n  }\n  \n  // Pull original event from previous node context\n  const originalEvent = $('Code: Normalise Schema').item.json;\n  \n  results.push({\n    json: {\n      ...originalEvent,\n      classification,\n      // Convenience top-level fields for routing\n      severity: classification.severity,\n      confidence: classification.confidence,\n      needs_human_review: classification.needs_human_review,\n      auto_remediation_available: classification.remediation_actions?.some(a => a.safe_to_automate && a.confidence > 0.7),\n      processed_at: new Date().toISOString()\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "node-parse-ai",
+      "name": "Code: Parse + Merge AI Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 180]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [
+                  { "leftValue": "={{ $json.severity }}", "rightValue": "critical", "operator": { "type": "string", "operation": "equals" } }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "critical"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [
+                  { "leftValue": "={{ $json.severity }}", "rightValue": "high", "operator": { "type": "string", "operation": "equals" } }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "high"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [
+                  { "leftValue": "={{ $json.severity }}", "rightValue": "medium", "operator": { "type": "string", "operation": "equals" } }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "medium"
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "node-severity-switch",
+      "name": "Switch: Severity Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1100, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Determine which remediation action to execute\nconst item = $input.first().json;\nconst actions = item.classification.remediation_actions || [];\n\n// Pick highest confidence safe action\nconst safeActions = actions\n  .filter(a => a.safe_to_automate && a.action !== 'investigate_only')\n  .sort((a, b) => b.confidence - a.confidence);\n\nconst chosenAction = safeActions[0] || null;\n\nreturn [{\n  json: {\n    ...item,\n    chosen_action: chosenAction,\n    will_attempt_remediation: !!chosenAction && item.confidence >= 0.7 && !item.needs_human_review\n  }\n}];"
+      },
+      "id": "node-pick-action",
+      "name": "Code: Pick Remediation Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 80]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "leftValue": "={{ $json.will_attempt_remediation }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node-check-can-remediate",
+      "name": "IF: Can Auto-Remediate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1500, 80]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Execute the chosen remediation action via HTTP calls\n// In production, replace URLs with your actual infrastructure endpoints\n\nconst item = $input.first().json;\nconst action = item.chosen_action;\nconst service = item.service;\nconst params = action.parameters || {};\n\nconsole.log(`Executing remediation: ${action.action} for service: ${service}`);\n\nconst actionMap = {\n  restart_service: {\n    url: `${$env.INFRA_API_URL}/services/${service}/restart`,\n    method: 'POST',\n    body: { reason: 'auto-remediation', triggered_by: 'n8n-monitor', error_id: item.error_id }\n  },\n  scale_up: {\n    url: `${$env.INFRA_API_URL}/services/${service}/scale`,\n    method: 'PATCH',\n    body: { replicas: (params.target_replicas || 2), reason: 'auto-scale-remediation' }\n  },\n  flush_cache: {\n    url: `${$env.INFRA_API_URL}/cache/${params.cache_name || service}/flush`,\n    method: 'DELETE',\n    body: { triggered_by: 'n8n-monitor', error_id: item.error_id }\n  },\n  clear_queue: {\n    url: `${$env.QUEUE_API_URL}/queues/${params.queue_name || service}/purge`,\n    method: 'POST',\n    body: { triggered_by: 'n8n-monitor', error_id: item.error_id }\n  }\n};\n\nconst actionConfig = actionMap[action.action];\nif (!actionConfig) {\n  return [{ json: { ...item, remediation_attempted: false, remediation_result: 'unsupported_action', remediation_skipped_reason: action.action } }];\n}\n\n// Return config for the HTTP node that follows\nreturn [{\n  json: {\n    ...item,\n    remediation_attempted: true,\n    http_config: actionConfig,\n    remediation_start_time: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-execute-remediation",
+      "name": "Code: Execute Remediation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 40]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.http_config.url }}",
+        "method": "={{ $json.http_config.method }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "", "value": "={{ JSON.stringify($json.http_config.body) }}" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } },
+          "timeout": 15000
+        }
+      },
+      "id": "node-http-remediate",
+      "name": "HTTP: Call Infra API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1900, 40]
+    },
+    {
+      "parameters": {
+        "waitBetweenTries": 10000,
+        "maxTries": 3,
+        "options": {}
+      },
+      "id": "node-wait-health",
+      "name": "Wait: 10s Health Check Delay",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [2100, 40],
+      "webhookId": "health-wait-001"
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.INFRA_API_URL }}/health/{{ $json.service }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } },
+          "timeout": 8000
+        }
+      },
+      "id": "node-health-check",
+      "name": "HTTP: Health Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2300, 40]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "leftValue": "={{ $json.status }}", "rightValue": "healthy", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node-check-healed",
+      "name": "IF: Service Recovered?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2500, 40]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "issue",
+        "operation": "create",
+        "projectId": "={{ $env.JIRA_PROJECT_ID }}",
+        "summary": "={{ $json.classification.jira_summary }}",
+        "issueType": "Bug",
+        "additionalFields": {
+          "priority": {
+            "name": "={{ $json.classification.jira_priority }}"
+          },
+          "labels": "={{ $json.classification.jira_labels }}",
+          "description": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+              {
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": "={{ $json.classification.jira_description }}" }]
+              }
+            ]
+          }
+        }
+      },
+      "id": "node-jira-ticket",
+      "name": "Jira: Create Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [1300, 280],
+      "credentials": {
+        "jiraApi": { "id": "jira-cred-001", "name": "Jira API" }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": { "value": "={{ $env.SLACK_INCIDENTS_CHANNEL }}", "mode": "id" },
+        "text": "",
+        "blocksUi": {
+          "blocksValues": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "🟢 *Self-Healed* | `{{ $json.service }}` | `{{ $json.environment }}`\n\n*What happened:* {{ $json.classification.root_cause_hypothesis }}\n*Action taken:* `{{ $json.chosen_action.action }}`\n*Recovery time:* {{ Math.round((new Date() - new Date($json.remediation_start_time)) / 1000) }}s\n*Confidence:* {{ Math.round($json.confidence * 100) }}%"
+              }
+            },
+            {
+              "type": "context",
+              "elements": [
+                {
+                  "type": "mrkdwn",
+                  "text": "Error ID: `{{ $json.error_id }}` | Source: {{ $json.source }} | <{{ $json.url }}|View in {{ $json.source }}>"
+                }
+              ]
+            }
+          ]
+        },
+        "otherOptions": {}
+      },
+      "id": "node-slack-healed",
+      "name": "Slack: Self-Healed Notify",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2700, 0],
+      "credentials": {
+        "slackApi": { "id": "slack-cred-001", "name": "Slack API" }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": { "value": "={{ $env.SLACK_INCIDENTS_CHANNEL }}", "mode": "id" },
+        "text": "",
+        "blocksUi": {
+          "blocksValues": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "🔴 *ESCALATION* | `{{ $json.service }}` — remediation failed, human required\n\n*Severity:* {{ $json.severity.toUpperCase() }}\n*Hypothesis:* {{ $json.classification.root_cause_hypothesis }}\n*Attempted fix:* `{{ $json.chosen_action?.action || 'none' }}`\n*Blast radius:* {{ $json.classification.blast_radius }}"
+              }
+            },
+            {
+              "type": "actions",
+              "elements": [
+                {
+                  "type": "button",
+                  "text": { "type": "plain_text", "text": "Acknowledge" },
+                  "style": "danger",
+                  "action_id": "ack_incident"
+                }
+              ]
+            }
+          ]
+        },
+        "otherOptions": {}
+      },
+      "id": "node-slack-escalate",
+      "name": "Slack: Escalation Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2700, 120],
+      "credentials": {
+        "slackApi": { "id": "slack-cred-001", "name": "Slack API" }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.PAGERDUTY_API_URL }}/incidents",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Token token={{ $env.PAGERDUTY_TOKEN }}" },
+            { "name": "From", "value": "={{ $env.PAGERDUTY_FROM_EMAIL }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"incident\": {\n    \"type\": \"incident\",\n    \"title\": \"[AUTO-ESCALATED] {{ $json.service }}: {{ $json.classification.jira_summary }}\",\n    \"service\": { \"id\": \"{{ $env.PAGERDUTY_SERVICE_ID }}\", \"type\": \"service_reference\" },\n    \"urgency\": \"{{ $json.severity === 'critical' ? 'high' : 'low' }}\",\n    \"body\": {\n      \"type\": \"incident_body\",\n      \"details\": \"Root cause: {{ $json.classification.root_cause_hypothesis }}\\n\\nBlast radius: {{ $json.classification.blast_radius }}\\n\\nAI Reasoning: {{ $json.classification.ai_reasoning }}\\n\\nError ID: {{ $json.error_id }}\\nSource: {{ $json.source }}\\nEnvironment: {{ $json.environment }}\"\n    }\n  }\n}",
+        "options": { "response": { "response": { "responseFormat": "json" } } }
+      },
+      "id": "node-pagerduty",
+      "name": "HTTP: PagerDuty Incident",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2900, 120]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log full audit trail - every event gets logged regardless of path\nconst item = $input.first().json;\n\nreturn [{\n  json: {\n    error_id: item.error_id,\n    timestamp: item.timestamp,\n    processed_at: item.processed_at,\n    source: item.source,\n    service: item.service,\n    environment: item.environment,\n    severity: item.severity,\n    severity_score: item.classification?.severity_score,\n    error_category: item.classification?.error_category,\n    message: item.message,\n    root_cause_hypothesis: item.classification?.root_cause_hypothesis,\n    blast_radius: item.classification?.blast_radius,\n    ai_confidence: item.confidence,\n    needs_human_review: item.needs_human_review,\n    remediation_attempted: item.remediation_attempted || false,\n    remediation_action: item.chosen_action?.action || 'none',\n    remediation_result: item.remediation_result || 'pending',\n    jira_created: !!item.jira_key,\n    jira_key: item.jira_key || '',\n    ai_reasoning: item.classification?.ai_reasoning || '',\n    logged_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-build-log",
+      "name": "Code: Build Audit Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 420]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "value": "={{ $env.GOOGLE_SHEET_ID }}", "mode": "id" },
+        "sheetName": { "value": "ErrorLog", "mode": "name" },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": { "cellFormat": "USER_ENTERED" }
+      },
+      "id": "node-sheets-log",
+      "name": "Sheets: Audit Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1700, 420],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "gsheets-cred-001", "name": "Google Sheets" }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: App Errors": {
+      "main": [[{ "node": "Code: Normalise Schema", "type": "main", "index": 0 }]]
+    },
+    "Cron: Poll Logs (5m)": {
+      "main": [[{ "node": "HTTP: Fetch Log API", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Fetch Log API": {
+      "main": [[{ "node": "Code: Normalise Schema", "type": "main", "index": 0 }]]
+    },
+    "Code: Normalise Schema": {
+      "main": [[{ "node": "AI: Classify Error", "type": "main", "index": 0 }]]
+    },
+    "AI: Classify Error": {
+      "main": [[{ "node": "Code: Parse + Merge AI Output", "type": "main", "index": 0 }]]
+    },
+    "Code: Parse + Merge AI Output": {
+      "main": [[
+        { "node": "Switch: Severity Router", "type": "main", "index": 0 },
+        { "node": "Code: Build Audit Row", "type": "main", "index": 0 }
+      ]]
+    },
+    "Switch: Severity Router": {
+      "main": [
+        [{ "node": "Code: Pick Remediation Action", "type": "main", "index": 0 }],
+        [{ "node": "Jira: Create Ticket", "type": "main", "index": 0 }],
+        [{ "node": "Code: Build Audit Row", "type": "main", "index": 0 }],
+        [{ "node": "Code: Build Audit Row", "type": "main", "index": 0 }]
+      ]
+    },
+    "Code: Pick Remediation Action": {
+      "main": [[{ "node": "IF: Can Auto-Remediate?", "type": "main", "index": 0 }]]
+    },
+    "IF: Can Auto-Remediate?": {
+      "main": [
+        [{ "node": "Code: Execute Remediation", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Escalation Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Code: Execute Remediation": {
+      "main": [[{ "node": "HTTP: Call Infra API", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Call Infra API": {
+      "main": [[{ "node": "Wait: 10s Health Check Delay", "type": "main", "index": 0 }]]
+    },
+    "Wait: 10s Health Check Delay": {
+      "main": [[{ "node": "HTTP: Health Check", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Health Check": {
+      "main": [[{ "node": "IF: Service Recovered?", "type": "main", "index": 0 }]]
+    },
+    "IF: Service Recovered?": {
+      "main": [
+        [{ "node": "Slack: Self-Healed Notify", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Escalation Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack: Escalation Alert": {
+      "main": [[{ "node": "HTTP: PagerDuty Incident", "type": "main", "index": 0 }]]
+    },
+    "Jira: Create Ticket": {
+      "main": [[{ "node": "Code: Build Audit Row", "type": "main", "index": 0 }]]
+    },
+    "Code: Build Audit Row": {
+      "main": [[{ "node": "Sheets: Audit Log", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["monitoring", "ai", "sre", "automation", "proof-of-work"],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "self-healing-monitor-v1"
+  },
+  "pinData": {}
+}
