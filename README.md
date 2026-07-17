@@ -29,7 +29,7 @@ Most monitoring setups alert humans and stop there. This system goes further:
 | **Route** | Switch node branches into Critical / High / Medium / Low tracks |
 | **Remediate** | For critical issues, executes the safest high-confidence action automatically |
 | **Verify** | Polls a health endpoint 10 seconds post-remediation |
-| **Self-heal** | Posts "🟢 Self-Healed in 34s" to Slack if recovered — zero human involvement |
+| **Self-heal** | Posts "🟢 Self-Healed in 34s" to Slack if recovered zero human involvement |
 | **Escalate** | Fires PagerDuty + enriched Slack alert only when auto-remediation fails |
 | **Ticket** | Creates fully-populated Jira tickets for High severity with investigation steps pre-written |
 | **Audit** | Logs every event, decision, and outcome to Google Sheets for trend analysis |
@@ -93,8 +93,8 @@ Most monitoring setups alert humans and stop there. This system goes further:
 
 ```
 📁 self-healing-error-monitor/
-├── 📄 self-healing-monitor.json      # n8n workflow — import directly
-├── 📄 weekly-digest.json             # Weekly digest branch — import separately
+├── 📄 self-healing-monitor.json      # n8n workflow import directly
+├── 📄 weekly-digest.json             # Weekly digest branch import separately
 ├── 📄 AI-CLASSIFICATION-PROMPT.md   # Full prompt design + engineering rationale
 ├── 📄 BRANCH-DEEP-DIVE.md           # Remediation + Jira branch walkthrough
 ├── 📄 SETUP-GUIDE.md                # Credentials, env vars, test payloads
@@ -197,13 +197,13 @@ The core intelligence is a **purpose-engineered GPT-4o prompt** designed as a de
 
 Key design decisions:
 
-**Conservative by design** — The prompt tells the model its output drives automated infrastructure actions with no human review. This primes it for precision over creativity.
+**Conservative by design** The prompt tells the model its output drives automated infrastructure actions with no human review. This primes it for precision over creativity.
 
-**Confidence-gated automation** — Actions are only executed when `confidence >= 0.7`. Below that, the system routes to human review regardless of severity.
+**Confidence-gated automation** Actions are only executed when `confidence >= 0.7`. Below that, the system routes to human review regardless of severity.
 
-**Explicit safety rules** — `safe_to_automate: true` is only permitted for: service restarts (stateless), cache flushes, scale-up, dead-letter queue clears. Database operations, rollbacks, and credential rotation are always `false`.
+**Explicit safety rules** `safe_to_automate: true` is only permitted for: service restarts (stateless), cache flushes, scale-up, dead-letter queue clears. Database operations, rollbacks, and credential rotation are always `false`.
 
-**Structured remediation array** — The AI outputs a ranked list of actions with individual confidence scores. The workflow picks the highest-confidence safe action, not the first in the list.
+**Structured remediation array** The AI outputs a ranked list of actions with individual confidence scores. The workflow picks the highest-confidence safe action, not the first in the list.
 
 See [AI-CLASSIFICATION-PROMPT.md](./AI-CLASSIFICATION-PROMPT.md) for the full prompt, rationale, and test cases.
 
@@ -223,12 +223,12 @@ See [AI-CLASSIFICATION-PROMPT.md](./AI-CLASSIFICATION-PROMPT.md) for the full pr
 
 ---
 
-## Weekly Digest — Sample Output
+## Weekly Digest Sample Output
 
 Every Monday at 09:00, a digest is posted to your incidents channel:
 
 ```
-📊 Weekly Incident Digest — w/c 11 Aug 2025
+📊 Weekly Incident Digest w/c 11 Aug 2025
 
 🟢 Auto-resolved:     12 incidents  (71%)
 🟡 Human-escalated:    4 incidents  (24%)
@@ -238,9 +238,9 @@ Every Monday at 09:00, a digest is posted to your incidents channel:
 📋 Jira tickets created: 4
 
 🔥 Top Failing Services
-  1. session-service    — 5 incidents  (Redis OOM recurring)
-  2. payment-service    — 3 incidents  (DB deadlock intermittent)
-  3. email-service      — 2 incidents  (SendGrid 3rd party)
+  1. session-service    5 incidents  (Redis OOM recurring)
+  2. payment-service    3 incidents  (DB deadlock intermittent)
+  3. email-service      2 incidents  (SendGrid 3rd party)
 
 📌 Highest Severity: payment-service deadlock [CRITICAL · 88/100]
    → Escalated to human · PD-4821
@@ -269,26 +269,26 @@ View full audit log → [Google Sheets]
 
 ## Design Principles
 
-**1. Graceful degradation** — Every branch has a fallback. If the AI parse fails, the event still gets routed (conservatively) and logged. If remediation fails, it escalates. Nothing falls silently.
+**1. Graceful degradation** Every branch has a fallback. If the AI parse fails, the event still gets routed (conservatively) and logged. If remediation fails, it escalates. Nothing falls silently.
 
-**2. Explainability over black-box** — Every AI decision is logged with `ai_reasoning`. Every automated action is attributed with `triggered_by: n8n-monitor` in the infra API call. Full audit trail, always.
+**2. Explainability over black-box** Every AI decision is logged with `ai_reasoning`. Every automated action is attributed with `triggered_by: n8n-monitor` in the infra API call. Full audit trail, always.
 
-**3. Conservative automation** — The system asks "is it safe to act?" before "should I act?". Confidence thresholds, safety flags, and blast-radius checks all gate the automation independently.
+**3. Conservative automation** The system asks "is it safe to act?" before "should I act?". Confidence thresholds, safety flags, and blast-radius checks all gate the automation independently.
 
-**4. Schema-first normalisation** — All four ingestion sources are normalised before AI classification. This means the AI prompt never needs to handle format variations — it always receives the same clean structure.
+**4. Schema-first normalisation** All four ingestion sources are normalised before AI classification. This means the AI prompt never needs to handle format variations it always receives the same clean structure.
 
-**5. Closed-loop verification** — Auto-remediation is meaningless without verification. The health check 10 seconds post-action is what makes this "self-healing" rather than just "auto-acting".
+**5. Closed-loop verification** Auto-remediation is meaningless without verification. The health check 10 seconds post-action is what makes this "self-healing" rather than just "auto-acting".
 
 ---
 
 ## Built With
 
-- [n8n](https://n8n.io) — Workflow automation platform
-- [OpenAI GPT-4o](https://platform.openai.com) — AI classification engine
-- [Jira Cloud API](https://developer.atlassian.com/cloud/jira/platform/rest/v3/) — Issue management
-- [Slack API](https://api.slack.com) — Notifications
-- [PagerDuty API](https://developer.pagerduty.com) — On-call escalation
-- [Google Sheets API](https://developers.google.com/sheets/api) — Audit logging
+- [n8n](https://n8n.io)  Workflow automation platform
+- [OpenAI GPT-4o](https://platform.openai.com)  AI classification engine
+- [Jira Cloud API](https://developer.atlassian.com/cloud/jira/platform/rest/v3/)  Issue management
+- [Slack API](https://api.slack.com) Notifications
+- [PagerDuty API](https://developer.pagerduty.com)  On-call escalation
+- [Google Sheets API](https://developers.google.com/sheets/api) Audit logging
 
 ---
 
